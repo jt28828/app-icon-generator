@@ -1,10 +1,13 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Documents;
 using System.Windows.Media.Imaging;
 using System.Xml;
 using AppIconGenerator.Annotations;
@@ -70,14 +73,14 @@ namespace AppIconGenerator.ViewModels
             string fileType;
             try
             {
-                fileType = file.FileName[(file.FileName.Length - 3)].ToString() +
-                           file.FileName[(file.FileName.Length - 2)].ToString() +
-                           file.FileName[(file.FileName.Length - 1)].ToString();
+                string fileName = file.FileName;
+                fileType =
+                    $"{fileName[fileName.Length - 3]}{fileName[fileName.Length - 2]}{fileName[fileName.Length - 1]}";
             }
             catch (Exception)
             {
                 // Filename doesn't exist
-                System.Windows.MessageBox.Show("Invalid File", "Only SVG files are supported");
+                MessageBox.Show("Invalid File", "Only SVG files are supported");
                 return;
             }
 
@@ -88,7 +91,7 @@ namespace AppIconGenerator.ViewModels
                 SelectedImage = file;
 
                 _svgContent = await ReadStreamAsTextAsync(file.FileContents);
-                SelectedImagePreview = ToBitmapImage(SvgStringToBitmap(_svgContent));
+                SelectedImagePreview = ToBitmapImage(await SvgStringToBitmap(_svgContent));
             }
             else
             {
@@ -97,7 +100,7 @@ namespace AppIconGenerator.ViewModels
             }
         }
 
-        public static BitmapImage ToBitmapImage(Bitmap bitmap)
+        private static BitmapImage ToBitmapImage(Bitmap bitmap)
         {
             using (var memory = new MemoryStream())
             {
@@ -115,17 +118,23 @@ namespace AppIconGenerator.ViewModels
             }
         }
 
-        public void SaveImages(string name = "icon")
+        public async void SaveImages(string name = "icon")
         {
             // Let the user pick the folder to save the file(s) in
             var folder = FileUtils.SelectFolder();
 
-            // Save Android then iOS
-            SaveAndroid(folder, name);
-            SaveIos(folder, name);
+            // Save Android and iOS and alert user
+            Task androidTask = SaveAndroid(folder, name);
+            Task iOsTask = SaveIos(folder, name);
+            Task webTask = SaveWeb(folder);
 
-            // Alert the User
-            System.Windows.MessageBox.Show($"Images were saved at: {folder}", "Success");
+            MessageBox.Show(
+                $"Icons are now generating in the background. This will take a while, please be patient and wait for the completion dialog",
+                "Warning", MessageBoxButton.OK);
+
+            // Alert the User when both are complete
+            await Task.WhenAll(androidTask, iOsTask, webTask);
+            MessageBox.Show($"Images were saved at: {folder}", "Success");
         }
 
         /// <summary>
@@ -141,20 +150,28 @@ namespace AppIconGenerator.ViewModels
             return svg;
         }
 
-        private Bitmap SvgStringToBitmap(string svgText, int size = 1000)
+        private async Task<Bitmap> SvgStringToBitmap(string svgText, int size = 1000)
         {
             XmlDocument doc = new XmlDocument {InnerXml = svgText};
             var svg = SvgDocument.Open(doc);
 
-            SizeF ignore = new SizeF();
-            svg.RasterizeDimensions(ref ignore, size, size);
+            // Resize the image, keeping its original dimensions
+            SizeF newDimensions = new SizeF(svg.Width.Value, svg.Height.Value);
+            svg.RasterizeDimensions(ref newDimensions, size, 0);
 
-            return svg.Draw();
+            // Set new dimensions onto image
+            svg.Width = newDimensions.Width;
+            svg.Height = newDimensions.Height;
+
+            Bitmap bitmap = svg.Draw();
+            // Wait a little bit for the image to render properly otherwise it corrupts. 500ms seems to work well
+            await Task.Delay(500);
+            return bitmap;
         }
 
         private static async Task<string> ReadStreamAsTextAsync(Stream stream)
         {
-            string fileContents = "";
+            string fileContents;
             stream.Position = 0;
             using (var reader = new StreamReader(stream))
             {
@@ -164,7 +181,7 @@ namespace AppIconGenerator.ViewModels
             return fileContents;
         }
 
-        private void SaveAndroid(string baseFolder, string fileName)
+        private async Task SaveAndroid(string baseFolder, string fileName)
         {
             // Create Android Subdirectories
             var androidDir = Path.Combine(baseFolder, "Android/");
@@ -174,28 +191,113 @@ namespace AppIconGenerator.ViewModels
                 Directory.CreateDirectory(androidDir);
             }
 
-            for (var i = 0; i < AndroidFileSizes.All.Length; i++)
+            var taskList = new List<Task>();
+
+            foreach (KeyValuePair<string, int> fileSize in AndroidFileSizes.All)
             {
-                var filesize = AndroidFileSizes.All[i];
-                var imageSizeName = AndroidFileSizes.AllNames[i];
-                // Throw each onto seperate threads
-                Task.Run(async () =>
+                // Put all image generation onto a separate thread
+                var newTask = Task.Run(async () =>
                 {
-                    var thisFolder = Path.Combine(androidDir, $"{imageSizeName}/");
+                    // Throw each onto seperate threads
+                    var thisFolder = Path.Combine(androidDir, $"{fileSize.Key}/");
                     if (!Directory.Exists(thisFolder))
                     {
                         Directory.CreateDirectory(thisFolder);
                     }
 
-                    var bitmap = SvgStringToBitmap(_svgContent, filesize);
-                    // Wait a little bit for the image to render properly otherwise it corrupts. 500ms seems to work well
-                    await Task.Delay(500);
+                    var bitmap = await SvgStringToBitmap(_svgContent, fileSize.Value);
                     WriteImageToFile(bitmap, thisFolder, fileName);
                 });
+
+                // Add to list to keep track
+                taskList.Add(newTask);
             }
+
+            // Wait for all images to be completed before completing the function
+            await Task.WhenAll(taskList);
         }
 
-        private void SaveIos(string baseFolder, string fileName)
+        private async Task SaveIos(string baseFolder, string fileName)
+        {
+            // First create the directories if required
+            (string iPhoneDir, string iPadDir, string imageDir) = CreateiOSDirectories(baseFolder);
+
+            var taskList = new List<Task>();
+
+            // Then create the app-icon sizes
+            foreach (KeyValuePair<string, int> fileSize in iOSFileSizes.iPhoneSizes)
+            {
+                // Throw each onto separate threads
+                var thisImageTask = Task.Run(async () =>
+                {
+                    var bitmap = await SvgStringToBitmap(_svgContent, fileSize.Value);
+                    WriteImageToFile(bitmap, iPhoneDir, $"{fileName}-{fileSize.Key}");
+                });
+                taskList.Add(thisImageTask);
+            }
+
+            foreach (KeyValuePair<string, int> fileSize in iOSFileSizes.iPadSizes)
+            {
+                // Throw each onto separate threads
+                var thisImageTask = Task.Run(async () =>
+                {
+                    var bitmap = await SvgStringToBitmap(_svgContent, fileSize.Value);
+                    WriteImageToFile(bitmap, iPadDir, $"{fileName}-{fileSize.Key}");
+                });
+                taskList.Add(thisImageTask);
+            }
+
+            // Finally create the 1x,2x,3x images
+
+            foreach (KeyValuePair<string, int> fileSize in iOSFileSizes.ImageSizes)
+            {
+                // Throw each onto separate threads
+                var thisImageTask = Task.Run(async () =>
+                {
+                    var bitmap = await SvgStringToBitmap(_svgContent, fileSize.Value);
+                    WriteImageToFile(bitmap, imageDir, $"{fileName}{fileSize.Key}");
+                });
+                taskList.Add(thisImageTask);
+            }
+
+            // Wait for all images to be completed before completing the function
+            await Task.WhenAll(taskList);
+        }
+
+        /// <summary>
+        /// Saves icons in PWA format to the Web folder
+        /// </summary>
+        private async Task SaveWeb(string baseFolder)
+        {
+            // Create Android Subdirectories
+            var webDir = Path.Combine(baseFolder, "Web/");
+
+            if (!Directory.Exists(webDir))
+            {
+                Directory.CreateDirectory(webDir);
+            }
+
+            var taskList = new List<Task>();
+
+            foreach (KeyValuePair<string, int> fileSize in WebFileSizes.All)
+            {
+                // Put all image generation onto a separate thread
+                var newTask = Task.Run(async () =>
+                {
+                    // Throw each onto separate threads
+                    var bitmap = await SvgStringToBitmap(_svgContent, fileSize.Value);
+                    WriteImageToFile(bitmap, webDir, fileSize.Key);
+                });
+
+                // Add to list to keep track
+                taskList.Add(newTask);
+            }
+
+            // Wait for all images to be completed before completing the function
+            await Task.WhenAll(taskList);
+        }
+
+        private Tuple<string, string, string> CreateiOSDirectories(string baseFolder)
         {
             // Create iOS Subdirectory
             var iOSDir = Path.Combine(baseFolder, "iOS/");
@@ -205,26 +307,34 @@ namespace AppIconGenerator.ViewModels
                 Directory.CreateDirectory(iOSDir);
             }
 
-            for (var i = 0; i < iOSFileSizes.All.Length; i++)
+            // Also create directory for both iPhone and iPad underneath the icon folder
+            var iconDir = Path.Combine(iOSDir, "Icons/");
+            if (!Directory.Exists(iconDir))
             {
-                var filesize = iOSFileSizes.All[i];
-                var imageSizeName = iOSFileSizes.AllNames[i];
-
-                // Throw each onto seperate threads
-                Task.Run(async () =>
-                {
-                    var thisFolder = Path.Combine(iOSDir, $"{imageSizeName}/");
-                    if (!Directory.Exists(thisFolder))
-                    {
-                        Directory.CreateDirectory(thisFolder);
-                    }
-
-                    var bitmap = SvgStringToBitmap(_svgContent, filesize);
-                    // Wait a little bit for the image to render properly otherwise it corrupts. 500ms seems to work well
-                    await Task.Delay(500);
-                    WriteImageToFile(bitmap, thisFolder, fileName);
-                });
+                Directory.CreateDirectory(iconDir);
             }
+
+            var iPhoneDir = Path.Combine(iconDir, "iPhone/");
+            var iPadDir = Path.Combine(iconDir, "iPad/");
+
+            if (!Directory.Exists(iPhoneDir))
+            {
+                Directory.CreateDirectory(iPhoneDir);
+            }
+
+            if (!Directory.Exists(iPadDir))
+            {
+                Directory.CreateDirectory(iPadDir);
+            }
+
+            // Then create a directory for the regular image resizes if using as an image
+            var imageDir = Path.Combine(iOSDir, "Images/");
+            if (!Directory.Exists(imageDir))
+            {
+                Directory.CreateDirectory(imageDir);
+            }
+
+            return Tuple.Create(iPhoneDir, iPadDir, imageDir);
         }
 
         private void WriteImageToFile(Bitmap image, string folder, string fileName)
